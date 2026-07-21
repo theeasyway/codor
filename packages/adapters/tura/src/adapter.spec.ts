@@ -65,7 +65,7 @@ console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_existing',status
   it('rejects unverified policy and thinking claims', () => {
     const adapter = new TuraAdapter('/fake/tura');
     expect(() => adapter.spawn({ cwd: '/work', policy: 'anything' })).toThrow('valid policies');
-    expect(() => adapter.spawn({ cwd: '/work', thinking: 'high' })).toThrow('does not support thinking');
+    expect(() => adapter.spawn({ cwd: '/work', thinking: 'ultra' })).toThrow('valid levels: low, medium, high, xhigh, max');
     expect(adapter.capabilities.policies).toEqual({
       'read-only': null, 'workspace-write': null, 'full-access': null,
     });
@@ -92,6 +92,22 @@ if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.
 console.log(JSON.stringify([{id:'ses_first'},{id:'ses_second'},{title:'missing id'}]));
 `);
     expect(new TuraAdapter(command).discoverSessions()).toEqual(['ses_first', 'ses_second']);
+  });
+
+  it('reports the source gateway configured coding models', async () => {
+    const command = executable(`
+const expected = ['--json','config','model-tiers'];
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(3);
+console.log(JSON.stringify({tiers:[
+  {tier:'thinking',options:[{provider:'codex',model:'gpt-5.6-sol'},{provider:'openai',model:'gpt-5.6-sol'}]},
+  {tier:'fast',options:[{provider:'codex',model:'gpt-5.6-luna'},{provider:'codex',model:'gpt-5.6-sol'}]},
+  {tier:'embedding_high',options:[{provider:'openai',model:'text-embedding-3-large'}]},
+]}));
+`);
+    await expect(new TuraAdapter(command).listModels()).resolves.toEqual({
+      models: ['codex/gpt-5.6-sol', 'openai/gpt-5.6-sol', 'codex/gpt-5.6-luna'],
+      source: 'discovered',
+    });
   });
 
   it('asks Tura to abort the native session before force-stopping the local process', async () => {
@@ -126,5 +142,12 @@ describe('Tura argv construction', () => {
     const base = { harness: 'tura', cwd: '/work' };
     expect(turaArgs({ ...base, policy: 'read-only' }, 'go'))
       .toEqual(turaArgs({ ...base, policy: 'workspace-write' }, 'go'));
+  });
+
+  it('maps Codor thinking effort to Tura model variants', () => {
+    expect(turaArgs({ harness: 'tura', cwd: '/work', thinking: 'max' }, 'go'))
+      .toContain('--model-variant');
+    expect(turaArgs({ harness: 'tura', cwd: '/work', thinking: 'max' }, 'go'))
+      .toContain('max');
   });
 });

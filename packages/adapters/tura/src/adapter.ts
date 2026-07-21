@@ -5,16 +5,27 @@ import spawn from 'cross-spawn';
 import type {
   AdapterTurnHooks,
   HarnessAdapter,
+  ModelCatalog,
   Session,
   SessionRef,
   SpawnOpts,
+  ThinkingLevel,
   WireEvent,
 } from '@codor/protocol';
-import { PolicySchema } from '@codor/protocol';
+import { PolicySchema, ThinkingLevelSchema } from '@codor/protocol';
 
 import { createTurnTranslator } from './translate.js';
 
 const ABORT_GRACE_MS = 5_000;
+
+/** Tura forwards these native variants to its selected provider. */
+export const TURA_THINKING_LEVELS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const satisfies readonly ThinkingLevel[];
 
 function missingBinary(): Error {
   return new Error('Tura adapter needs CODOR_TURA_BIN set to the pinned source-built tura binary');
@@ -31,6 +42,16 @@ function turaEnv(sessionEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
+function assertThinkingLevel(thinking: ThinkingLevel | undefined): void {
+  if (thinking === undefined) return;
+  if (!(TURA_THINKING_LEVELS as readonly string[]).includes(thinking)) {
+    throw new Error(
+      `adapter 'tura' does not support thinking level '${thinking}'; ` +
+      `valid levels: ${TURA_THINKING_LEVELS.join(', ')}`,
+    );
+  }
+}
+
 export function turaArgs(session: Session, payload: string): string[] {
   const args = [
     '--cwd', session.cwd,
@@ -44,9 +65,35 @@ export function turaArgs(session: Session, payload: string): string[] {
     '--session-type', 'coding',
   ];
   if (session.model !== undefined) args.push('--model', session.model);
+  if (session.thinking !== undefined) {
+    ThinkingLevelSchema.parse(session.thinking);
+    assertThinkingLevel(session.thinking);
+    args.push('--model-variant', session.thinking);
+  }
   if (session.session_ref !== undefined) args.push('--session', session.session_ref);
   args.push(payload);
   return args;
+}
+
+function turaCatalogModels(value: unknown): string[] {
+  if (typeof value !== 'object' || value === null) throw new Error('Tura returned an invalid model catalog');
+  const tiers = (value as { tiers?: unknown }).tiers;
+  if (!Array.isArray(tiers)) throw new Error('Tura returned an invalid model catalog');
+  const models = new Set<string>();
+  for (const tier of tiers) {
+    if (typeof tier !== 'object' || tier === null) continue;
+    const { tier: name, options } = tier as { tier?: unknown; options?: unknown };
+    if ((name !== 'fast' && name !== 'thinking') || !Array.isArray(options)) continue;
+    for (const option of options) {
+      if (typeof option !== 'object' || option === null) continue;
+      const { provider, model } = option as { provider?: unknown; model?: unknown };
+      if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
+        models.add(`${provider}/${model}`);
+      }
+    }
+  }
+  if (models.size === 0) throw new Error('Tura listed no coding models');
+  return [...models];
 }
 
 /** A CLI adapter for the source-built Tura release, configured through CODOR_TURA_BIN. */
@@ -59,7 +106,8 @@ export class TuraAdapter implements HarnessAdapter {
     ask: false,
     approvals: 'runtime',
     extensions: false,
-    thinking: false,
+    thinking: true,
+    thinking_levels: TURA_THINKING_LEVELS,
     policies: {
       'read-only': null,
       'workspace-write': null,
@@ -76,14 +124,30 @@ export class TuraAdapter implements HarnessAdapter {
       throw new Error(`unknown policy '${opts.policy}'; valid policies: ${PolicySchema.options.join(', ')}`);
     }
     if (opts.thinking !== undefined) {
-      throw new Error("adapter 'tura' does not support thinking levels");
+      ThinkingLevelSchema.parse(opts.thinking);
+      assertThinkingLevel(opts.thinking);
     }
     return {
       harness: this.id,
       cwd: opts.cwd,
       model: opts.model,
       policy: opts.policy,
+      thinking: opts.thinking,
     };
+  }
+
+  /** Reads the source Tura gateway's configured fast and thinking model choices. */
+  async listModels(): Promise<ModelCatalog> {
+    const command = commandFor(this.command);
+    const result = spawn.sync(command, ['--json', 'config', 'model-tiers'], {
+      timeout: 5_000,
+      maxBuffer: 1_000_000,
+      encoding: 'utf8',
+      env: turaEnv(),
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`Command failed: ${command} --json config model-tiers`);
+    return { models: turaCatalogModels(JSON.parse(result.stdout)), source: 'discovered' };
   }
 
   attach(session_ref: SessionRef): Session {
