@@ -54,7 +54,7 @@ console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_existing',status
     for await (const event of adapter.deliver(session, 'PONG')) events.push(event);
     const done = events.at(-1) as Extract<WireEvent, { type: 'run.completed' }>;
     expect(JSON.parse(done.final_text!)).toEqual({
-      argv: ['--cwd', cwd, 'run', '--zsh', '--output', 'ndjson', '--agent-id', 'balanced', '--session-type', 'coding', '--model', 'openai/gpt-5.6-sol', '--session', 'ses_existing', 'PONG'],
+      argv: ['--cwd', cwd, 'run', '--zsh', '--output', 'ndjson', '--agent-id', 'balanced', '--session-type', 'coding', '--timeout', '3600', '--model', 'openai/gpt-5.6-sol', '--session', 'ses_existing', 'PONG'],
       cwd: realpathSync(cwd),
       input: '',
       projectRoot: undefined,
@@ -83,6 +83,23 @@ console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_existing',status
       { harness: 'tura', cwd: process.cwd() }, 'hello',
     )) failed.push(event);
     expect(failed.at(-1)).toMatchObject({ type: 'run.completed', status: 'failed', final_text: 'native failure' });
+  });
+
+  it('lets Tura exit cleanly after its terminal event instead of killing its session checkpoint', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codor-tura-clean-exit-'));
+    dirs.push(dir);
+    const checkpoint = join(dir, 'checkpoint');
+    const command = executable(`
+const fs = require('node:fs');
+console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_clean',status:'completed',finalText:'done'}));
+setTimeout(() => fs.writeFileSync(process.env.TURA_CHECKPOINT, 'clean'), 25);
+`);
+    const session = new TuraAdapter(command).spawn({ cwd: dir });
+    session.env = { TURA_CHECKPOINT: checkpoint };
+    const events: WireEvent[] = [];
+    for await (const event of new TuraAdapter(command).deliver(session, 'finish')) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'completed', final_text: 'done' });
+    expect(readFileSync(checkpoint, 'utf8')).toBe('clean');
   });
 
   it('discovers root sessions through Tura session list JSON', () => {

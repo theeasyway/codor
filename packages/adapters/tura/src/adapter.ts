@@ -17,6 +17,10 @@ import { PolicySchema, ThinkingLevelSchema } from '@codor/protocol';
 import { createTurnTranslator } from './translate.js';
 
 const ABORT_GRACE_MS = 5_000;
+// Tura's CLI defaults one invocation to ten minutes. Codor members are
+// persistent and their operator can interrupt them, so that implicit ceiling
+// can terminate an otherwise healthy long-running turn mid-checkpoint.
+const TURA_TURN_TIMEOUT_SECONDS = 60 * 60;
 
 /** Tura forwards these native variants to its selected provider. */
 export const TURA_THINKING_LEVELS = [
@@ -63,6 +67,7 @@ export function turaArgs(session: Session, payload: string): string[] {
     '--output', 'ndjson',
     '--agent-id', process.env.CODOR_TURA_AGENT_ID ?? 'balanced',
     '--session-type', 'coding',
+    '--timeout', String(TURA_TURN_TIMEOUT_SECONDS),
   ];
   if (session.model !== undefined) args.push('--model', session.model);
   if (session.thinking !== undefined) {
@@ -215,7 +220,6 @@ export class TuraAdapter implements HarnessAdapter {
         for (const event of translator.push(line)) {
           reportSessionRef();
           yield event;
-          if (event.type === 'run.completed') return;
         }
         reportSessionRef();
       }
