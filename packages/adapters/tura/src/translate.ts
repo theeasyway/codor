@@ -194,9 +194,21 @@ export function createTurnTranslator(): TurnTranslator {
           streamError = errorText(event.error) ?? 'Tura reported a failed run';
           return finish('failed');
         case 'session.status':
-          // `run --zsh --session` remains subscribed when the native session
-          // reaches idle instead of emitting cli.completed.
-          return event.status === 'idle' && sawTerminalTurnActivity ? finish('completed') : [];
+          // `run --zsh --session` stays subscribed when the native session reaches
+          // idle instead of emitting cli.completed.
+          if (event.status === 'idle' && sawTerminalTurnActivity) return finish('completed');
+          // A session that enters `error` WITHOUT having produced an answer is the hang
+          // case: tura's run loop finalizes an error only when a new assistant message
+          // exists (→ cli.completed, handled above), otherwise it polls to its --timeout
+          // ceiling while the gateway keeps forwarding this event to us. Short-circuit
+          // ONLY the answerless case so the reaper kills the polling process in seconds.
+          // If an answer WAS produced (finalText set), an error just means a sub-call
+          // retried/cancelled — routine on tool-heavy turns — and cli.completed is
+          // coming, so we must NOT pre-empt it, or a successful turn is mislabelled.
+          if (event.status === 'error' && finalText === '') {
+            return finish('interrupted', 'Tura session entered an error state before producing a response');
+          }
+          return [];
         default:
           return [];
       }

@@ -24,10 +24,24 @@ const ABORT_GRACE_MS = 5_000;
 // cleanup a short grace, then reap the detached process group so the iterator
 // finishes and Codor persists the already-emitted completed turn.
 const TURA_TERMINAL_GRACE_MS = 3_000;
-// Tura's CLI defaults one invocation to ten minutes. Codor members are
-// persistent and their operator can interrupt them, so that implicit ceiling
-// can terminate an otherwise healthy long-running turn mid-checkpoint.
-const TURA_TURN_TIMEOUT_SECONDS = 60 * 60;
+// Inactivity (stall) timeout: the primary halt detector. Reset on every line of
+// stream output, so a healthy turn — which keeps emitting tool calls, deltas, and
+// status events as it works — never trips it no matter how long it runs. Only an
+// agent that has genuinely HALTED (a serious error stops it emitting anything) goes
+// silent this long, at which point the process group is reaped and the turn ends
+// interrupted. This is unrelated to total run length by construction; the single
+// caveat is a long silent tool call (a build/test emits nothing until it finishes),
+// so this must exceed the longest legitimately-silent operation inside a turn.
+const TURA_STALL_GRACE_MS = 10 * 60 * 1_000;
+// A catastrophic backstop ONLY — deliberately unrelated to expected run length.
+// Real turns can legitimately run for hours, so this must never act as a length
+// limit (Tura's 10-minute default did, and would guillotine a healthy long turn).
+// Hangs are caught by signal, not the clock: the session.status:error short-circuit
+// in the translator ends the common hang the moment Tura reports it, and the
+// post-terminal reaper handles a child that lingers after a terminal event. This
+// ceiling exists solely so a truly wedged process (no terminal signal ever) cannot
+// live forever; a run approaching it is pathological, and the operator can Stop sooner.
+const TURA_TURN_TIMEOUT_SECONDS = 24 * 60 * 60;
 
 /** Tura forwards these native variants to its selected provider. */
 export const TURA_THINKING_LEVELS = [
@@ -132,6 +146,7 @@ export class TuraAdapter implements HarnessAdapter {
   constructor(
     private readonly command = process.env.CODOR_TURA_BIN,
     private readonly terminalGraceMs = TURA_TERMINAL_GRACE_MS,
+    private readonly stallGraceMs = TURA_STALL_GRACE_MS,
   ) {}
 
   spawn(opts: SpawnOpts): Session {
@@ -230,6 +245,23 @@ export class TuraAdapter implements HarnessAdapter {
     };
     void closed.then(() => { if (terminalReaper !== undefined) clearTimeout(terminalReaper); });
 
+    // Inactivity (stall) timer — the primary halt detector. Reset on every stream
+    // line; if the agent goes silent for the whole grace it has halted (a serious
+    // error stopped it emitting anything), so reap the process group and finalize the
+    // turn as interrupted. A healthy long run keeps emitting activity that resets
+    // this, so it never limits run length.
+    let stalled = false;
+    let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+    const bumpInactivity = (): void => {
+      if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        stalled = true;
+        if (child.exitCode === null && child.signalCode === null) this.signal(child, 'SIGKILL');
+      }, this.stallGraceMs);
+      inactivityTimer.unref?.();
+    };
+    void closed.then(() => { if (inactivityTimer !== undefined) clearTimeout(inactivityTimer); });
+
     try {
       try {
         await spawned;
@@ -239,8 +271,10 @@ export class TuraAdapter implements HarnessAdapter {
         return;
       }
       hooks.onStarted?.({ pid: child.pid, process_group_id: child.pid });
+      bumpInactivity();
       const lines = createInterface({ input: child.stdout! });
       for await (const line of lines) {
+        bumpInactivity();
         for (const event of translator.push(line)) {
           reportSessionRef();
           yield event;
@@ -254,15 +288,22 @@ export class TuraAdapter implements HarnessAdapter {
         : exit.code !== null && exit.code !== 0
           ? `Tura exited with code ${exit.code}`
           : undefined;
-      const detail = stderr.trim() || childError?.message || exitDetail;
-      const status = childError !== undefined || (exit.code !== null && exit.code !== 0)
-        ? 'failed'
-        : exit.code === 0
-          ? 'completed'
-          : 'interrupted';
+      // A stall reap is a halt, not a process failure: surface it as interrupted
+      // with a clear reason rather than the generic SIGKILL exit detail.
+      const detail = stalled
+        ? 'Tura turn stalled — the agent produced no output within the inactivity grace'
+        : stderr.trim() || childError?.message || exitDetail;
+      const status = stalled
+        ? 'interrupted'
+        : childError !== undefined || (exit.code !== null && exit.code !== 0)
+          ? 'failed'
+          : exit.code === 0
+            ? 'completed'
+            : 'interrupted';
       yield* translator.end({ status, ...(detail && { error: detail }) });
     } finally {
       if (terminalReaper !== undefined) clearTimeout(terminalReaper);
+      if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
       this.children.delete(session);
       if (child.exitCode === null && child.signalCode === null) this.signal(child, 'SIGKILL');
     }

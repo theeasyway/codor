@@ -54,7 +54,7 @@ console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_existing',status
     for await (const event of adapter.deliver(session, 'PONG')) events.push(event);
     const done = events.at(-1) as Extract<WireEvent, { type: 'run.completed' }>;
     expect(JSON.parse(done.final_text!)).toEqual({
-      argv: ['--cwd', cwd, 'run', '--zsh', '--output', 'ndjson', '--agent-id', 'balanced', '--session-type', 'coding', '--timeout', '3600', '--model', 'openai/gpt-5.6-sol', '--session', 'ses_existing', 'PONG'],
+      argv: ['--cwd', cwd, 'run', '--zsh', '--output', 'ndjson', '--agent-id', 'balanced', '--session-type', 'coding', '--timeout', '86400', '--model', 'openai/gpt-5.6-sol', '--session', 'ses_existing', 'PONG'],
       cwd: realpathSync(cwd),
       input: '',
       projectRoot: undefined,
@@ -136,6 +136,49 @@ setInterval(() => {}, 1000);
     expect(events.at(-1)).toMatchObject({
       type: 'run.completed', status: 'completed', final_text: 'answer stays',
     });
+  });
+
+  it('reaps a halted Tura process that goes silent with no terminal event (inactivity)', async () => {
+    // Emits some activity, then goes silent forever without exiting or emitting a
+    // terminal event — a halted agent. The inactivity timer must reap it and end the
+    // turn interrupted in bounded time.
+    const command = executable(`
+console.log(JSON.stringify({type:'cli.started',sessionID:'ses_stall'}));
+console.log(JSON.stringify({type:'command.updated',sessionID:'ses_stall',raw:{payload:{properties:{commandID:'c1',status:'running',command:{command_type:'zsh',command_line:'{}'}}}}}));
+setInterval(() => {}, 1000);
+`);
+    const started = Date.now();
+    const events: WireEvent[] = [];
+    // Short injected inactivity grace so the test is fast; default terminal grace.
+    for await (const event of new TuraAdapter(command, undefined, 250).deliver(
+      { harness: 'tura', cwd: process.cwd() }, 'go',
+    )) events.push(event);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(2_000);
+    const done = events.at(-1) as Extract<WireEvent, { type: 'run.completed' }>;
+    expect(done).toMatchObject({ type: 'run.completed', status: 'interrupted' });
+    expect(done.error).toMatch(/stalled/i);
+  });
+
+  it('does not stall-reap a Tura process that keeps emitting activity', async () => {
+    // Emits immediately, then a line every 100ms, then completes — each gap stays
+    // under the 600ms inactivity grace, so it must finish completed, never
+    // stall-reaped. (Grace is comfortably above Node's process-startup latency so the
+    // first line always arrives in time.)
+    const command = executable(`
+console.log(JSON.stringify({type:'cli.started',sessionID:'ses_live'}));
+let n = 0;
+const t = setInterval(() => {
+  n++;
+  console.log(JSON.stringify({type:'message.part.delta',sessionID:'ses_live',text:'.'}));
+  if (n >= 5) { clearInterval(t); console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_live',status:'completed',finalText:'done'})); }
+}, 100);
+`);
+    const events: WireEvent[] = [];
+    for await (const event of new TuraAdapter(command, undefined, 600).deliver(
+      { harness: 'tura', cwd: process.cwd() }, 'go',
+    )) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'completed', final_text: 'done' });
   });
 
   it('discovers root sessions through Tura session list JSON', () => {

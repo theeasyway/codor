@@ -40,8 +40,10 @@ tura --cwd CWD run --zsh --output ndjson --agent-id ID --session-type coding \
 
 `--zsh` selects the gateway-owned command-run surface (the proven headless contract);
 the plain run surface can complete the model turn and then return a nonzero runtime
-status. `--timeout 3600` overrides Tura's implicit per-invocation ceiling so a healthy
-long turn is not cut mid-checkpoint. Stdin is `ignore`d, the process is spawned
+status. `--timeout` is a catastrophic backstop only (24h), deliberately unrelated to run
+length — real turns can run for hours, so hangs are caught by signal (the
+`session.status:error` short-circuit and the post-terminal reaper), never by the clock.
+Stdin is `ignore`d, the process is spawned
 `detached` (own process group), stdout is read line-by-line through EOF, and stderr is
 bounded (last 8 KiB) for failure detail. `session.env` is merged over `process.env`.
 
@@ -64,6 +66,8 @@ bounded (last 8 KiB) for failure detail. `session.env` is merged over `process.e
 | `message.updated` (assistant) | accumulate final assistant text; mark terminal activity |
 | `command.updated` | `run.item/tool_call`, then `run.item/tool_result` on a terminal command status |
 | `session.status` = `idle` (after terminal activity) | `run.completed` = completed |
+| `session.status` = `error`, **no answer produced yet** | `run.completed` = interrupted (hang short-circuit) |
+| `session.status` = `error`, answer already produced | ignored — `cli.completed` will finalize it |
 | `cli.failed` | `run.completed` = failed (error = reported message) |
 | `cli.completed` | mapped by status — see below |
 | stream EOF, then process exit | `run.completed` from exit code (0 → completed, nonzero → failed, else interrupted) |
@@ -99,6 +103,22 @@ completion or an early idle) then SIGKILLs the detached process group so the asy
 iterator finishes and Codor persists the already-emitted turn. The timer is cleared if
 the child exits first, so a checkpoint written shortly after the terminal event still
 lands.
+
+Hangs (an agent that stops before any terminal event) are detected by signal and
+inactivity, never by total run length — real turns can run for hours:
+
+1. **`session.status:error` short-circuit** (translator) — a session that errors *before*
+   producing an answer is the reported-halt case; tura's `run` would poll to `--timeout`,
+   but the gateway forwards the event, so the translator ends the turn immediately
+   (interrupted). Gated on "no answer yet": an error *after* an answer is a routine
+   retried/cancelled sub-call that `cli.completed` will finalize.
+2. **Inactivity timer** (`TURA_STALL_GRACE_MS`, 10 min) — the primary halt detector for a
+   *silent* halt (a serious error that stops the agent emitting anything). Reset on every
+   stream line, so a healthy long run never trips it; only prolonged silence does, at which
+   point the process group is reaped and the turn ends interrupted. Must exceed the longest
+   legitimately-silent operation in a turn (a build/test emits nothing until it finishes).
+3. **`--timeout` wall-clock** (24h) — catastrophic backstop only, for a process wedged with
+   no signal ever. Deliberately unrelated to run length.
 
 ## Capability truth
 

@@ -124,6 +124,37 @@ describe('Tura NDJSON translation', () => {
     }))).toEqual([{ type: 'run.completed', status: 'completed', final_text: 'PONG' }]);
   });
 
+  it('short-circuits a session that errors before producing any answer (the hang case)', () => {
+    // No assistant answer yet → tura would poll to its --timeout ceiling. The
+    // error event is the only terminal signal, so finish now (interrupted) to let
+    // the reaper kill the polling process instead of hanging.
+    const translator = createTurnTranslator();
+    translator.push(JSON.stringify({ type: 'command.updated', sessionID: 'ses_err', raw: { payload: { properties: {
+      commandID: 'c1', status: 'running', command: { command_type: 'zsh', command_line: '{"command":"pwd"}' },
+    } } } }));
+    expect(translator.push('{"type":"session.status","sessionID":"ses_err","status":"error"}'))
+      .toEqual([{
+        type: 'run.completed', status: 'interrupted',
+        final_text: 'Tura session entered an error state before producing a response',
+        error: 'Tura session entered an error state before producing a response',
+      }]);
+  });
+
+  it('does NOT short-circuit a session error once an answer exists (cli.completed will finalize it)', () => {
+    // Assistant answer present → tura will emit cli.completed for the error; a
+    // session.status:error here is a routine retried/cancelled sub-call and must
+    // not pre-empt the completed turn.
+    const translator = createTurnTranslator();
+    expect(translator.push(JSON.stringify({
+      type: 'message.updated', sessionID: 'ses_ok', text: 'the analysis is done',
+      raw: { payload: { properties: { info: { role: 'assistant' } } } },
+    }))).toEqual([]);
+    expect(translator.push('{"type":"session.status","sessionID":"ses_ok","status":"error"}')).toEqual([]);
+    // The forthcoming cli.completed (even status:failed) then completes it via the hybrid map.
+    expect(translator.push('{"type":"cli.completed","sessionID":"ses_ok","status":"failed"}'))
+      .toEqual([{ type: 'run.completed', status: 'completed', final_text: 'the analysis is done' }]);
+  });
+
   it('ignores idle before a terminal turn event', () => {
     const translator = createTurnTranslator();
     expect(translator.push(JSON.stringify({
