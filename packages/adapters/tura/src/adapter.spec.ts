@@ -77,12 +77,18 @@ console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_existing',status
       { harness: 'tura', cwd: process.cwd() }, 'hello',
     )) events.push(event);
     expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'failed' });
-    const command = executable("process.stderr.write('native failure\\n'); process.exit(7);");
+    const command = executable(`
+console.log(JSON.stringify({type:'message.updated', sessionID:'ses_failed', text:'partial answer', raw:{payload:{properties:{info:{role:'assistant'}}}}}));
+process.stderr.write('native failure\\n');
+process.exit(7);
+`);
     const failed: WireEvent[] = [];
     for await (const event of new TuraAdapter(command).deliver(
       { harness: 'tura', cwd: process.cwd() }, 'hello',
     )) failed.push(event);
-    expect(failed.at(-1)).toMatchObject({ type: 'run.completed', status: 'failed', final_text: 'native failure' });
+    expect(failed.at(-1)).toMatchObject({
+      type: 'run.completed', status: 'failed', final_text: 'partial answer', error: 'native failure',
+    });
   });
 
   it('lets Tura exit cleanly after its terminal event instead of killing its session checkpoint', async () => {

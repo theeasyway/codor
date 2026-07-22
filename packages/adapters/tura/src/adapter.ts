@@ -224,7 +224,12 @@ export class TuraAdapter implements HarnessAdapter {
         reportSessionRef();
       }
       const exit = await closed;
-      const detail = stderr.trim() || childError?.message;
+      const exitDetail = exit.signal !== null
+        ? `Tura terminated by ${exit.signal}`
+        : exit.code !== null && exit.code !== 0
+          ? `Tura exited with code ${exit.code}`
+          : undefined;
+      const detail = stderr.trim() || childError?.message || exitDetail;
       const status = childError !== undefined || (exit.code !== null && exit.code !== 0)
         ? 'failed'
         : exit.code === 0

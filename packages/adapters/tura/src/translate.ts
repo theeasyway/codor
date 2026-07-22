@@ -81,12 +81,15 @@ export function createTurnTranslator(): TurnTranslator {
   ): WireEvent[] => {
     if (terminal) return [];
     terminal = true;
-    const resolved = finalText || streamError || error;
+    const resolvedFinalText = finalText || streamError || error;
+    // A process-level failure can arrive after an assistant update. Keep the
+    // useful response text, but never let it hide the reason the turn failed.
+    const resolvedError = streamError || error || (status !== 'completed' ? resolvedFinalText : undefined);
     return [{
       type: 'run.completed',
       status,
-      ...(resolved && { final_text: resolved }),
-      ...(status !== 'completed' && resolved && { error: resolved }),
+      ...(resolvedFinalText && { final_text: resolvedFinalText }),
+      ...(status !== 'completed' && resolvedError && { error: resolvedError }),
     }];
   };
 
