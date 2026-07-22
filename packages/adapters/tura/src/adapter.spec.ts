@@ -108,6 +108,36 @@ setTimeout(() => fs.writeFileSync(process.env.TURA_CHECKPOINT, 'clean'), 25);
     expect(readFileSync(checkpoint, 'utf8')).toBe('clean');
   });
 
+  it('reaps a Tura process that emits its terminal result, checkpoints, then never exits', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codor-tura-hang-'));
+    dirs.push(dir);
+    const checkpoint = join(dir, 'checkpoint');
+    // Valid terminal result, a checkpoint written shortly after (native
+    // session cleanup), then the process deliberately hangs forever.
+    const command = executable(`
+const fs = require('node:fs');
+console.log(JSON.stringify({type:'cli.completed',sessionID:'ses_hang',status:'completed',finalText:'answer stays'}));
+setTimeout(() => fs.writeFileSync(process.env.TURA_CHECKPOINT, 'late'), 50);
+setInterval(() => {}, 1000);
+`);
+    // Short injected grace keeps the test fast while still outlasting the 50ms
+    // checkpoint write.
+    const session = new TuraAdapter(command, 250).spawn({ cwd: dir });
+    session.env = { TURA_CHECKPOINT: checkpoint };
+    const started = Date.now();
+    const events: WireEvent[] = [];
+    for await (const event of new TuraAdapter(command, 250).deliver(session, 'finish')) events.push(event);
+    const elapsed = Date.now() - started;
+    // The iterator must finish on its own — the whole point of the fix.
+    expect(elapsed).toBeLessThan(2_000);
+    // Grace must outlast the checkpoint write, not race it.
+    expect(readFileSync(checkpoint, 'utf8')).toBe('late');
+    // The already-emitted completed turn and its text survive the reap.
+    expect(events.at(-1)).toMatchObject({
+      type: 'run.completed', status: 'completed', final_text: 'answer stays',
+    });
+  });
+
   it('discovers root sessions through Tura session list JSON', () => {
     const command = executable(`
 const expected = ['--json','session','list','--all'];

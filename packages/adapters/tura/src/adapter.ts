@@ -17,6 +17,13 @@ import { PolicySchema, ThinkingLevelSchema } from '@codor/protocol';
 import { createTurnTranslator } from './translate.js';
 
 const ABORT_GRACE_MS = 5_000;
+// Once the translator emits a terminal `run.completed`, the turn is done from
+// Codor's perspective. Tura sometimes lingers past that point finishing native
+// session/checkpoint cleanup and, occasionally, never exits — leaving stdout
+// open so the deliver() iterator (and the member) hangs `running`. Give that
+// cleanup a short grace, then reap the detached process group so the iterator
+// finishes and Codor persists the already-emitted completed turn.
+const TURA_TERMINAL_GRACE_MS = 3_000;
 // Tura's CLI defaults one invocation to ten minutes. Codor members are
 // persistent and their operator can interrupt them, so that implicit ceiling
 // can terminate an otherwise healthy long-running turn mid-checkpoint.
@@ -122,7 +129,10 @@ export class TuraAdapter implements HarnessAdapter {
 
   private readonly children = new WeakMap<Session, ChildProcess>();
 
-  constructor(private readonly command = process.env.CODOR_TURA_BIN) {}
+  constructor(
+    private readonly command = process.env.CODOR_TURA_BIN,
+    private readonly terminalGraceMs = TURA_TERMINAL_GRACE_MS,
+  ) {}
 
   spawn(opts: SpawnOpts): Session {
     if (opts.policy !== undefined && !PolicySchema.safeParse(opts.policy).success) {
@@ -206,6 +216,20 @@ export class TuraAdapter implements HarnessAdapter {
       hooks.onSessionRef?.(discovered);
     };
 
+    // Armed once the translator reports the turn semantically complete. Reaps
+    // the process group if Tura's post-terminal cleanup never lets stdout close
+    // on its own. Not armed for tool-completion or early idle events — only a
+    // real `run.completed` from the translator counts.
+    let terminalReaper: ReturnType<typeof setTimeout> | undefined;
+    const armTerminalReaper = (): void => {
+      if (terminalReaper !== undefined) return;
+      terminalReaper = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) this.signal(child, 'SIGKILL');
+      }, this.terminalGraceMs);
+      terminalReaper.unref?.();
+    };
+    void closed.then(() => { if (terminalReaper !== undefined) clearTimeout(terminalReaper); });
+
     try {
       try {
         await spawned;
@@ -220,6 +244,7 @@ export class TuraAdapter implements HarnessAdapter {
         for (const event of translator.push(line)) {
           reportSessionRef();
           yield event;
+          if (event.type === 'run.completed') armTerminalReaper();
         }
         reportSessionRef();
       }
@@ -237,6 +262,7 @@ export class TuraAdapter implements HarnessAdapter {
           : 'interrupted';
       yield* translator.end({ status, ...(detail && { error: detail }) });
     } finally {
+      if (terminalReaper !== undefined) clearTimeout(terminalReaper);
       this.children.delete(session);
       if (child.exitCode === null && child.signalCode === null) this.signal(child, 'SIGKILL');
     }
