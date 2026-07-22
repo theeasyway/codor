@@ -47,10 +47,39 @@ describe('Tura NDJSON translation', () => {
     expect(translator.end({ status: 'failed' })).toEqual([]);
   });
 
-  it('does not mistake a completed CLI process for a completed native turn', () => {
+  it('keeps a completed native turn whose session briefly errored (finalText present)', () => {
+    // Tura's run surface reports `failed` with the finished answer in finalText when
+    // the session momentarily reached `error` during the turn (a retried/cancelled
+    // sub-call — routine on tool-heavy turns). The answer is the turn's real output,
+    // so it must land as a completed turn, not a hard failure that blanks it and kills
+    // the member.
     const translator = createTurnTranslator();
-    expect(translator.push('{"type":"cli.completed","sessionID":"ses_bad","status":"failed","finalText":"gateway error"}'))
-      .toEqual([{ type: 'run.completed', status: 'failed', final_text: 'gateway error', error: 'gateway error' }]);
+    expect(translator.push('{"type":"cli.completed","sessionID":"ses_soft","status":"failed","finalText":"the audit is complete"}'))
+      .toEqual([{ type: 'run.completed', status: 'completed', final_text: 'the audit is complete' }]);
+  });
+
+  it('fails a native turn that ends failed with no produced answer', () => {
+    const translator = createTurnTranslator();
+    // With no produced answer, finish() mirrors the failure detail into final_text,
+    // exactly as the cli.failed path does; the daemon blanks it for failed runs.
+    expect(translator.push('{"type":"cli.completed","sessionID":"ses_empty","status":"failed"}'))
+      .toEqual([{
+        type: 'run.completed', status: 'failed',
+        final_text: 'Tura ended the turn in a failed state without producing a response',
+        error: 'Tura ended the turn in a failed state without producing a response',
+      }]);
+  });
+
+  it('maps a timed-out turn to interrupted, preserving any partial answer', () => {
+    const translator = createTurnTranslator();
+    expect(translator.push('{"type":"cli.completed","sessionID":"ses_to","status":"timeout","finalText":"partial work"}'))
+      .toEqual([{ type: 'run.completed', status: 'interrupted', final_text: 'partial work', error: 'Tura turn timed out' }]);
+  });
+
+  it('maps a permission-gated turn to interrupted rather than failed', () => {
+    const translator = createTurnTranslator();
+    expect(translator.push('{"type":"cli.completed","sessionID":"ses_perm","status":"permission_required","finalText":"needs approval to continue"}'))
+      .toEqual([{ type: 'run.completed', status: 'interrupted', final_text: 'needs approval to continue', error: 'Tura turn paused awaiting permission' }]);
   });
 
   it('maps the current source runtime command payload without duplicate results', () => {

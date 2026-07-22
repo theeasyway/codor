@@ -163,9 +163,33 @@ export function createTurnTranslator(): TurnTranslator {
           }
           return events;
         }
-        case 'cli.completed':
+        case 'cli.completed': {
           if (typeof event.finalText === 'string' && event.finalText !== '') finalText = event.finalText;
-          return finish(event.status === 'completed' ? 'completed' : 'failed');
+          // Tura's run result reports exactly one of completed | failed | timeout |
+          // permission_required (apps/tui/src/types/session.ts). Its `run` surface
+          // returns `failed` WITH the full assistant answer in finalText whenever the
+          // native session momentarily reached an `error` state during the turn — a
+          // retried or cancelled sub-call (run.ts: `status === 'error' && hasNewAssistant
+          // → buildRunResult(..., 'failed')`). That is routine on tool-heavy turns and
+          // is NOT a real failure: Tura fills finalText from the last assistant message,
+          // so a present answer is the turn's genuine output. Mapping it to a hard
+          // `failed` blanks a valid answer and kills the member. Map by real semantics:
+          switch (event.status) {
+            case 'completed':
+              return finish('completed');
+            case 'timeout':
+              return finish('interrupted', 'Tura turn timed out');
+            case 'permission_required':
+              return finish('interrupted', 'Tura turn paused awaiting permission');
+            default:
+              // `failed` (session error) or any other terminal status: a produced
+              // answer is the turn's real output; only a truly empty result is a
+              // genuine failure worth surfacing as one.
+              return finalText !== ''
+                ? finish('completed')
+                : finish('failed', 'Tura ended the turn in a failed state without producing a response');
+          }
+        }
         case 'cli.failed':
           streamError = errorText(event.error) ?? 'Tura reported a failed run';
           return finish('failed');
